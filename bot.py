@@ -1,8 +1,9 @@
 import os
 import logging
+from datetime import datetime
+from typing import List, Dict
 import json
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+import threading
 from dotenv import load_dotenv
 
 from telegram import (
@@ -20,8 +21,6 @@ from telegram.ext import (
     filters
 )
 from telegram.constants import ParseMode
-import pymongo
-import redis
 
 # Load environment variables
 load_dotenv()
@@ -35,343 +34,379 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
-REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS', '').split(','))) if os.getenv('ADMIN_IDS') else []
+PORT = int(os.getenv('PORT', 8080))
 
-# Initialize MongoDB
-try:
-    client = pymongo.MongoClient(MONGODB_URI)
-    db = client['telegram_referral_bot']
+# Simple in-memory storage (for demo)
+# In production, use a database
+class Storage:
+    def __init__(self):
+        self.channels = []  # Format: {'chat_id': -1001234567890, 'name': 'Channel'}
+        self.users = {}     # Format: {user_id: {user_data}}
+        self.load_data()
     
-    # Test connection
-    client.server_info()
-    logger.info("✅ MongoDB connected successfully")
+    def load_data(self):
+        """Load data from files if exists"""
+        try:
+            # Try to load from file
+            if os.path.exists('channels.json'):
+                with open('channels.json', 'r') as f:
+                    self.channels = json.load(f)
+            
+            if os.path.exists('users.json'):
+                with open('users.json', 'r') as f:
+                    self.users = json.load(f)
+        except:
+            pass
     
-    # Create collections if they don't exist
-    if 'users' not in db.list_collection_names():
-        db.create_collection('users')
-    if 'channels' not in db.list_collection_names():
-        db.create_collection('channels')
-    if 'referrals' not in db.list_collection_names():
-        db.create_collection('referrals')
-    
-    users_collection = db['users']
-    channels_collection = db['channels']
-    referrals_collection = db['referrals']
-    
-except Exception as e:
-    logger.error(f"❌ MongoDB connection failed: {e}")
-    # Create simple in-memory storage for testing
-    db = None
-    users_collection = None
-    channels_collection = None
-    referrals_collection = None
+    def save_data(self):
+        """Save data to files"""
+        try:
+            with open('channels.json', 'w') as f:
+                json.dump(self.channels, f)
+            
+            with open('users.json', 'w') as f:
+                json.dump(self.users, f)
+        except Exception as e:
+            logger.error(f"Error saving data: {e}")
 
-# Initialize Redis
-try:
-    redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-    redis_client.ping()
-    logger.info("✅ Redis connected successfully")
-except Exception as e:
-    logger.error(f"❌ Redis connection failed: {e}")
-    redis_client = None
-
-# In-memory storage for channels (fallback if MongoDB fails)
-MEMORY_CHANNELS = []
+# Global storage instance
+storage = Storage()
 
 class ChannelManager:
-    @staticmethod
-    def get_active_channels() -> List[Dict]:
-        """Get all active channels from database or memory"""
-        try:
-            if channels_collection is not None:
-                channels = list(channels_collection.find({'is_active': True}))
-                return channels
-            else:
-                return MEMORY_CHANNELS
-        except Exception as e:
-            logger.error(f"Error getting channels: {e}")
-            return []
+    """Manage channels - only UID required"""
     
     @staticmethod
-    def add_channel(chat_id: int, invite_link: str, title: str) -> bool:
-        """Add a new channel"""
+    def get_channels() -> List[Dict]:
+        """Get all channels"""
+        return storage.channels
+    
+    @staticmethod
+    def add_channel(chat_id: str) -> bool:
+        """Add a new channel using only UID"""
         try:
-            if channels_collection is not None:
-                channel_data = {
-                    'chat_id': chat_id,
-                    'invite_link': invite_link,
-                    'title': title,
-                    'is_active': True,
-                    'created_at': datetime.now()
-                }
-                channels_collection.insert_one(channel_data)
-                return True
+            # Convert chat_id to proper format
+            clean_id = chat_id.strip()
+            
+            # If it starts with @, keep as is
+            if clean_id.startswith('@'):
+                chat_id_str = clean_id
             else:
-                # Add to memory
-                MEMORY_CHANNELS.append({
-                    'chat_id': chat_id,
-                    'invite_link': invite_link,
-                    'title': title,
-                    'is_active': True
-                })
-                return True
+                # For numeric IDs, ensure it's negative
+                if clean_id.startswith('-'):
+                    chat_id_str = clean_id
+                elif clean_id.isdigit() or (clean_id.startswith('100') and len(clean_id) > 9):
+                    chat_id_str = f"-{clean_id.lstrip('-')}"
+                else:
+                    return False
+            
+            # Check if already exists
+            for channel in storage.channels:
+                if str(channel.get('chat_id')) == str(chat_id_str):
+                    return False
+            
+            # Create channel entry with default name
+            channel = {
+                'chat_id': chat_id_str,
+                'name': f"Channel {len(storage.channels) + 1}",
+                'added_at': datetime.now().isoformat()
+            }
+            storage.channels.append(channel)
+            storage.save_data()
+            return True
         except Exception as e:
             logger.error(f"Error adding channel: {e}")
             return False
     
     @staticmethod
-    def remove_channel(chat_id: int) -> bool:
+    def remove_channel(chat_id: str) -> bool:
         """Remove a channel"""
         try:
-            if channels_collection is not None:
-                result = channels_collection.delete_one({'chat_id': chat_id})
-                return result.deleted_count > 0
-            else:
-                global MEMORY_CHANNELS
-                MEMORY_CHANNELS = [c for c in MEMORY_CHANNELS if c['chat_id'] != chat_id]
+            original_count = len(storage.channels)
+            storage.channels = [
+                c for c in storage.channels 
+                if str(c.get('chat_id')) != str(chat_id.strip())
+            ]
+            
+            if len(storage.channels) < original_count:
+                storage.save_data()
                 return True
+            return False
         except Exception as e:
             logger.error(f"Error removing channel: {e}")
             return False
 
 class UserManager:
-    @staticmethod
-    async def get_or_create_user(user_id: int, username: str = None, first_name: str = None) -> Dict:
-        """Get or create user"""
-        try:
-            if users_collection is not None:
-                user = users_collection.find_one({'user_id': user_id})
-                
-                if not user:
-                    referral_code = f"REF{user_id}"
-                    user_data = {
-                        'user_id': user_id,
-                        'username': username,
-                        'first_name': first_name,
-                        'balance': 0.0,
-                        'referral_code': referral_code,
-                        'referral_count': 0,
-                        'total_earned': 0.0,
-                        'created_at': datetime.now(),
-                        'last_active': datetime.now(),
-                        'has_joined_channels': False,
-                        'is_banned': False
-                    }
-                    users_collection.insert_one(user_data)
-                    return user_data
-                return user
-            else:
-                # Simple memory user
-                return {
-                    'user_id': user_id,
-                    'username': username,
-                    'first_name': first_name,
-                    'balance': 0.0,
-                    'referral_code': f"REF{user_id}",
-                    'referral_count': 0,
-                    'total_earned': 0.0,
-                    'has_joined_channels': False,
-                    'is_banned': False
-                }
-        except Exception as e:
-            logger.error(f"Error getting user: {e}")
-            return {
-                'user_id': user_id,
-                'first_name': first_name or 'User',
-                'balance': 0.0,
-                'referral_code': f"REF{user_id}",
-                'referral_count': 0,
-                'total_earned': 0.0,
-                'has_joined_channels': False
-            }
+    """Manage user data"""
     
     @staticmethod
-    async def update_balance(user_id: int, amount: float, reason: str):
-        """Update user balance"""
+    def get_user(user_id: int) -> Dict:
+        """Get or create user"""
+        user_str = str(user_id)
+        
+        if user_str in storage.users:
+            return storage.users[user_str]
+        
+        # Create new user
+        user_data = {
+            'user_id': user_id,
+            'balance': 0.0,
+            'referral_code': f"REF{user_id}",
+            'referral_count': 0,
+            'total_earned': 0.0,
+            'total_withdrawn': 0.0,
+            'joined_at': datetime.now().isoformat(),
+            'last_active': datetime.now().isoformat(),
+            'transactions': [],
+            'has_joined_channels': False
+        }
+        
+        storage.users[user_str] = user_data
+        storage.save_data()
+        return user_data
+    
+    @staticmethod
+    def update_user(user_id: int, updates: Dict):
+        """Update user data"""
+        user_str = str(user_id)
+        if user_str in storage.users:
+            storage.users[user_str].update(updates)
+            storage.users[user_str]['last_active'] = datetime.now().isoformat()
+            storage.save_data()
+    
+    @staticmethod
+    def add_transaction(user_id: int, amount: float, tx_type: str, description: str):
+        """Add transaction to history"""
+        user = UserManager.get_user(user_id)
+        
+        transaction = {
+            'id': len(user.get('transactions', [])) + 1,
+            'amount': amount,
+            'type': tx_type,
+            'description': description,
+            'date': datetime.now().isoformat()
+        }
+        
+        if 'transactions' not in user:
+            user['transactions'] = []
+        
+        user['transactions'].append(transaction)
+        
+        # Keep only last 50 transactions
+        if len(user['transactions']) > 50:
+            user['transactions'] = user['transactions'][-50:]
+        
+        UserManager.update_user(user_id, user)
+    
+    @staticmethod
+    def add_referral(referrer_id: int, referred_id: int):
+        """Add referral reward"""
+        if referrer_id == referred_id:
+            return
+        
+        referrer = UserManager.get_user(referrer_id)
+        
+        # Add 1 RS reward
+        new_balance = referrer.get('balance', 0) + 1.0
+        UserManager.update_user(referrer_id, {
+            'balance': new_balance,
+            'referral_count': referrer.get('referral_count', 0) + 1,
+            'total_earned': referrer.get('total_earned', 0) + 1.0
+        })
+        
+        # Add transaction
+        UserManager.add_transaction(
+            referrer_id, 
+            1.0, 
+            'credit', 
+            f'Referral bonus for user {referred_id}'
+        )
+
+async def check_channel_membership(bot, user_id: int) -> tuple:
+    """Check if user is member of all channels"""
+    channels = ChannelManager.get_channels()
+    
+    if not channels:
+        return True, []  # No channels required
+    
+    not_joined = []
+    
+    for channel in channels:
+        chat_id = channel['chat_id']
         try:
-            if users_collection is not None:
-                user = users_collection.find_one({'user_id': user_id})
-                if user:
-                    new_balance = user.get('balance', 0) + amount
-                    users_collection.update_one(
-                        {'user_id': user_id},
-                        {
-                            '$set': {'balance': new_balance},
-                            '$inc': {'total_earned': amount, 'referral_count': 1 if reason == 'referral' else 0}
-                        }
-                    )
+            # Try to get chat member
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+            if member.status in ['left', 'kicked']:
+                not_joined.append(channel)
         except Exception as e:
-            logger.error(f"Error updating balance: {e}")
+            logger.error(f"Error checking channel {chat_id}: {e}")
+            # Assume not joined if error
+            not_joined.append(channel)
+    
+    return len(not_joined) == 0, not_joined
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     user = update.effective_user
     
-    # Get or create user
-    user_data = await UserManager.get_or_create_user(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name
-    )
-    
-    # Check referral code
+    # Check referral parameter
     args = context.args
     if args and args[0].startswith('REF'):
         referral_code = args[0]
-        if referral_code != user_data['referral_code']:
-            # Find referrer
-            if users_collection is not None:
-                referrer = users_collection.find_one({'referral_code': referral_code})
-                if referrer and referrer['user_id'] != user.id:
-                    # Record referral
-                    if referrals_collection is not None:
-                        referrals_collection.insert_one({
-                            'referrer_id': referrer['user_id'],
-                            'referred_id': user.id,
-                            'created_at': datetime.now()
-                        })
-                    
-                    # Add reward to referrer
-                    await UserManager.update_balance(referrer['user_id'], 1.0, 'referral')
-                    
+        # Find referrer
+        for user_id_str, user_data in storage.users.items():
+            if user_data.get('referral_code') == referral_code:
+                referrer_id = int(user_id_str)
+                if referrer_id != user.id:
+                    UserManager.add_referral(referrer_id, user.id)
                     await update.message.reply_text(
-                        f"🎉 You were referred by {referrer.get('first_name', 'a friend')}! "
-                        f"They earned ₹1 for your join."
+                        f"🎉 Welcome! You were referred by user {referrer_id}. "
+                        f"They earned ₹1 for your join!"
                     )
+                break
     
     # Check channel membership
-    channels = ChannelManager.get_active_channels()
+    has_joined, not_joined = await check_channel_membership(
+        context.bot, user.id
+    )
     
-    if not channels:
-        # No channels required, show main menu directly
-        await show_main_menu(update, context)
-        return
-    
-    not_joined = []
-    for channel in channels:
-        try:
-            member = await context.bot.get_chat_member(
-                chat_id=channel['chat_id'],
-                user_id=user.id
-            )
-            if member.status in ['left', 'kicked']:
-                not_joined.append(channel)
-        except Exception as e:
-            logger.error(f"Error checking channel {channel['chat_id']}: {e}")
-            not_joined.append(channel)
-    
-    if not_joined:
-        # Show join buttons
-        keyboard = []
-        for channel in not_joined:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"📢 Join {channel['title']}",
-                    url=channel['invite_link']
-                )
-            ])
-        keyboard.append([
-            InlineKeyboardButton("✅ Check Membership", callback_data="check_membership")
-        ])
-        
-        channel_list = "\n".join([f"• {ch['title']}" for ch in not_joined])
-        
-        await update.message.reply_text(
-            f"🔒 **Welcome to the bot!**\n\n"
-            f"To continue, please join these channels:\n{channel_list}\n\n"
-            f"After joining, click the button below to verify.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.MARKDOWN
-        )
+    if not has_joined and not_joined:
+        await show_join_buttons(update, context, not_joined)
     else:
-        # Already joined all channels
+        UserManager.update_user(user.id, {'has_joined_channels': True})
         await show_main_menu(update, context)
 
-async def check_membership_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check if user has joined all channels"""
+async def show_join_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, not_joined: List[Dict]):
+    """Show join buttons for channels"""
+    user = update.effective_user
+    
+    # Create buttons
+    keyboard = []
+    for channel in not_joined:
+        chat_id = channel['chat_id']
+        channel_name = channel.get('name', 'Join Channel')
+        
+        # Create button
+        if isinstance(chat_id, str) and chat_id.startswith('-'):
+            try:
+                # Try to create invite link
+                chat = await context.bot.get_chat(int(chat_id))
+                invite_link = await chat.export_invite_link()
+                keyboard.append([
+                    InlineKeyboardButton(f"📢 {channel_name}", url=invite_link)
+                ])
+            except:
+                # Fallback URL
+                keyboard.append([
+                    InlineKeyboardButton(f"📢 {channel_name}", url=f"https://t.me/{chat_id.lstrip('-')}")
+                ])
+        elif isinstance(chat_id, str) and chat_id.startswith('@'):
+            keyboard.append([
+                InlineKeyboardButton(f"📢 {channel_name}", url=f"https://t.me/{chat_id.lstrip('@')}")
+            ])
+        else:
+            keyboard.append([
+                InlineKeyboardButton(f"📢 {channel_name}", url=f"https://t.me/c/{chat_id}")
+            ])
+    
+    keyboard.append([
+        InlineKeyboardButton("✅ Verify Join", callback_data="verify_join")
+    ])
+    
+    channel_count = len(not_joined)
+    message = (
+        f"👋 Welcome {user.first_name}!\n\n"
+        f"To access all features, please join {channel_count} channel(s).\n"
+        f"After joining, click 'Verify Join' button below."
+    )
+    
+    await update.message.reply_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Verify user has joined all channels"""
     query = update.callback_query
     await query.answer()
     
     user = update.effective_user
-    channels = ChannelManager.get_active_channels()
     
-    if not channels:
-        await query.edit_message_text("No channels required. Welcome!")
+    # Check membership
+    has_joined, not_joined = await check_channel_membership(
+        context.bot, user.id
+    )
+    
+    if has_joined:
+        UserManager.update_user(user.id, {'has_joined_channels': True})
+        await query.edit_message_text(
+            "✅ **Verified!** You've joined all required channels.\n\n"
+            "Now you can access all features."
+        )
         await show_main_menu_callback(update, context)
-        return
-    
-    not_joined = []
-    for channel in channels:
-        try:
-            member = await context.bot.get_chat_member(
-                chat_id=channel['chat_id'],
-                user_id=user.id
-            )
-            if member.status in ['left', 'kicked']:
-                not_joined.append(channel)
-        except Exception as e:
-            logger.error(f"Error checking channel {channel['chat_id']}: {e}")
-            not_joined.append(channel)
-    
-    if not_joined:
+    else:
         # Still not joined
+        channel_list = "\n".join([f"• {ch.get('name', 'Join Channel')}" for ch in not_joined])
+        
         keyboard = []
         for channel in not_joined:
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"📢 Join {channel['title']}",
-                    url=channel['invite_link']
-                )
-            ])
+            chat_id = channel['chat_id']
+            channel_name = channel.get('name', 'Join Channel')
+            
+            if isinstance(chat_id, str) and chat_id.startswith('-'):
+                try:
+                    chat = await context.bot.get_chat(int(chat_id))
+                    invite_link = await chat.export_invite_link()
+                    keyboard.append([
+                        InlineKeyboardButton(f"📢 {channel_name}", url=invite_link)
+                    ])
+                except:
+                    keyboard.append([
+                        InlineKeyboardButton(f"📢 {channel_name}", url=f"https://t.me/{chat_id.lstrip('-')}")
+                    ])
+            else:
+                keyboard.append([
+                    InlineKeyboardButton(f"📢 {channel_name}", url=f"https://t.me/c/{chat_id}")
+                ])
+        
         keyboard.append([
-            InlineKeyboardButton("✅ Check Again", callback_data="check_membership")
+            InlineKeyboardButton("🔄 Check Again", callback_data="verify_join")
         ])
         
-        channel_list = "\n".join([f"• {ch['title']}" for ch in not_joined])
-        
         await query.edit_message_text(
-            f"❌ **Still not joined!**\n\n"
-            f"Please join these channels:\n{channel_list}",
+            f"❌ **Not joined yet!**\n\n"
+            f"You still need to join:\n{channel_list}",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
-    else:
-        # Successfully joined
-        if users_collection is not None:
-            users_collection.update_one(
-                {'user_id': user.id},
-                {'$set': {'has_joined_channels': True}}
-            )
-        
-        await query.edit_message_text("✅ **Great! You've joined all channels.**")
-        await show_main_menu_callback(update, context)
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show main menu"""
     user = update.effective_user
-    user_data = await UserManager.get_or_create_user(user.id)
+    user_data = UserManager.get_user(user.id)
     
     message = (
-        f"🎉 **Welcome {user_data['first_name']}!**\n\n"
-        f"💰 **Balance:** ₹{user_data.get('balance', 0):.2f}\n"
-        f"👥 **Referrals:** {user_data.get('referral_count', 0)}\n"
-        f"💵 **Total Earned:** ₹{user_data.get('total_earned', 0):.2f}\n\n"
-        f"🔗 **Your Referral Link:**\n"
-        f"`https://t.me/{context.bot.username}?start={user_data['referral_code']}`\n\n"
-        "Share this link to earn ₹1 for each friend who joins!"
+        f"👤 **Account Overview**\n\n"
+        f"🆔 **User ID:** `{user.id}`\n"
+        f"👤 **Name:** {user.first_name}\n"
+        f"💰 **Balance:** ₹{user_data['balance']:.2f}\n"
+        f"👥 **Referrals:** {user_data['referral_count']}\n"
+        f"💵 **Total Earned:** ₹{user_data['total_earned']:.2f}\n"
+        f"📤 **Total Withdrawn:** ₹{user_data['total_withdrawn']:.2f}"
     )
     
     keyboard = [
-        [InlineKeyboardButton("👥 My Referrals", callback_data="my_referrals")],
-        [InlineKeyboardButton("💰 Withdraw", callback_data="withdraw")],
-        [InlineKeyboardButton("📢 Required Channels", callback_data="view_channels")],
-        [InlineKeyboardButton("🆘 Help", callback_data="help")]
+        [InlineKeyboardButton("💰 Balance", callback_data="balance"),
+         InlineKeyboardButton("📤 Withdraw", callback_data="withdraw")],
+        [InlineKeyboardButton("📜 History", callback_data="history"),
+         InlineKeyboardButton("👥 Referrals", callback_data="referrals")],
+        [InlineKeyboardButton("🔗 Invite Link", callback_data="invite_link"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="refresh")]
     ]
     
     if user.id in ADMIN_IDS:
-        keyboard.append([InlineKeyboardButton("👑 Admin Panel", callback_data="admin_panel")])
+        keyboard.append([InlineKeyboardButton("👑 Admin", callback_data="admin_panel")])
     
     if update.callback_query:
         await update.callback_query.message.reply_text(
@@ -390,43 +425,22 @@ async def show_main_menu_callback(update: Update, context: ContextTypes.DEFAULT_
     """Show main menu from callback"""
     await show_main_menu(update, context)
 
-async def view_channels_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """View required channels"""
-    query = update.callback_query
-    await query.answer()
-    
-    channels = ChannelManager.get_active_channels()
-    
-    if not channels:
-        message = "📭 No channels required at the moment."
-    else:
-        message = "📢 **Required Channels:**\n\n"
-        for i, channel in enumerate(channels, 1):
-            message += f"{i}. {channel['title']}\n"
-    
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]]
-    await query.edit_message_text(
-        text=message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def my_referrals_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user's referrals"""
+async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show balance details"""
     query = update.callback_query
     await query.answer()
     
     user = update.effective_user
+    user_data = UserManager.get_user(user.id)
     
-    if referrals_collection is not None:
-        referrals = list(referrals_collection.find({'referrer_id': user.id}))
-        count = len(referrals)
-    else:
-        count = 0
-    
-    message = f"👥 **Your Referrals:** {count}\n\n"
-    message += f"💰 **Earned from referrals:** ₹{count * 1:.2f}\n\n"
-    message += f"Your referral link:\n`https://t.me/{context.bot.username}?start=REF{user.id}`"
+    message = (
+        f"💰 **Balance Details**\n\n"
+        f"💳 **Available:** ₹{user_data['balance']:.2f}\n"
+        f"📈 **Total Earned:** ₹{user_data['total_earned']:.2f}\n"
+        f"📤 **Total Withdrawn:** ₹{user_data['total_withdrawn']:.2f}\n\n"
+        f"👥 **Referral Earnings:** ₹{user_data['referral_count']:.0f}\n\n"
+        f"💎 **Earn more:** Share your invite link!"
+    )
     
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]]
     await query.edit_message_text(
@@ -441,17 +455,18 @@ async def withdraw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user = update.effective_user
-    user_data = await UserManager.get_or_create_user(user.id)
+    user_data = UserManager.get_user(user.id)
     
     message = (
-        f"💰 **Withdrawal**\n\n"
-        f"Your balance: ₹{user_data.get('balance', 0):.2f}\n"
-        f"Minimum withdrawal: ₹10\n\n"
-        "To withdraw, send:\n"
-        "`/withdraw <amount> <method>`\n\n"
-        "Example:\n"
-        "`/withdraw 50 UPI`\n\n"
-        "Supported methods: UPI, Paytm, PhonePe"
+        f"📤 **Withdrawal**\n\n"
+        f"💰 **Balance:** ₹{user_data['balance']:.2f}\n"
+        f"📦 **Minimum:** ₹10\n\n"
+        "**How to withdraw:**\n"
+        "Use command: `/withdraw <amount> <method>`\n\n"
+        "**Examples:**\n"
+        "`/withdraw 50 UPI`\n"
+        "`/withdraw 100 Paytm`\n\n"
+        "**Methods:** UPI, Paytm, PhonePe, Bank"
     )
     
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]]
@@ -464,12 +479,14 @@ async def withdraw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /withdraw command"""
     user = update.effective_user
-    user_data = await UserManager.get_or_create_user(user.id)
+    user_data = UserManager.get_user(user.id)
     
     if not context.args or len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: /withdraw <amount> <method>\n"
-            "Example: /withdraw 50 UPI"
+            "❌ **Usage:** `/withdraw <amount> <method>`\n\n"
+            "**Example:** `/withdraw 50 UPI`\n"
+            "**Methods:** UPI, Paytm, PhonePe, Bank",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
     
@@ -477,20 +494,27 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = float(context.args[0])
         method = context.args[1].upper()
         
+        # Validate
         if amount < 10:
             await update.message.reply_text("❌ Minimum withdrawal is ₹10")
             return
         
-        if amount > user_data.get('balance', 0):
+        if amount > user_data['balance']:
             await update.message.reply_text("❌ Insufficient balance")
             return
         
-        # For now, just show confirmation
-        await update.message.reply_text(
-            f"✅ Withdrawal request submitted!\n\n"
-            f"Amount: ₹{amount}\n"
-            f"Method: {method}\n\n"
-            f"Your request will be processed within 24 hours."
+        # Process withdrawal
+        new_balance = user_data['balance'] - amount
+        UserManager.update_user(user.id, {
+            'balance': new_balance,
+            'total_withdrawn': user_data.get('total_withdrawn', 0) + amount
+        })
+        
+        UserManager.add_transaction(
+            user.id,
+            -amount,
+            'withdrawal',
+            f'Withdrawal via {method}'
         )
         
         # Notify admin
@@ -498,41 +522,47 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.send_message(
                     chat_id=admin_id,
-                    text=f"💰 New withdrawal request:\n"
-                         f"User: {user_data['first_name']}\n"
-                         f"Amount: ₹{amount}\n"
-                         f"Method: {method}\n"
-                         f"User ID: {user.id}"
+                    text=f"💰 **New Withdrawal**\n\n"
+                         f"👤 User: {user.first_name}\n"
+                         f"🆔 ID: {user.id}\n"
+                         f"💵 Amount: ₹{amount:.2f}\n"
+                         f"📱 Method: {method}"
                 )
             except:
                 pass
         
+        await update.message.reply_text(
+            f"✅ **Withdrawal Requested!**\n\n"
+            f"💵 **Amount:** ₹{amount:.2f}\n"
+            f"📱 **Method:** {method}\n"
+            f"⏳ **Status:** Pending\n"
+            f"📅 **Processed within:** 24 hours\n\n"
+            f"💰 **New Balance:** ₹{new_balance:.2f}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
     except ValueError:
         await update.message.reply_text("❌ Invalid amount")
 
-async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show help"""
+async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show transaction history"""
     query = update.callback_query
     await query.answer()
     
-    message = (
-        "🆘 **Help**\n\n"
-        "📢 **How it works:**\n"
-        "1. Join required channels\n"
-        "2. Get your referral link\n"
-        "3. Share with friends\n"
-        "4. Earn ₹1 per referral\n\n"
-        "💰 **Withdrawal:**\n"
-        "• Minimum: ₹10\n"
-        "• Methods: UPI, Paytm, PhonePe\n"
-        "• Use: `/withdraw <amount> <method>`\n\n"
-        "📝 **Commands:**\n"
-        "• /start - Start bot\n"
-        "• /balance - Check balance\n"
-        "• /referral - Get referral link\n"
-        "• /withdraw - Withdraw money\n"
-        "• /help - Show this message"
-    )
+    user = update.effective_user
+    user_data = UserManager.get_user(user.id)
+    
+    transactions = user_data.get('transactions', [])
+    
+    if not transactions:
+        message = "📜 **No transactions yet**\n\nShare your invite link to start earning!"
+    else:
+        message = "📜 **Transaction History**\n\n"
+        for tx in reversed(transactions[-10:]):  # Show last 10
+            amount = tx['amount']
+            tx_type = "➕" if tx['type'] == 'credit' else "➖"
+            date = datetime.fromisoformat(tx['date']).strftime('%d %b %H:%M')
+            message += f"`{date}` {tx_type} ₹{amount:.2f}\n{tx['description']}\n\n"
     
     keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]]
     await query.edit_message_text(
@@ -541,111 +571,155 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /balance command"""
-    user = update.effective_user
-    user_data = await UserManager.get_or_create_user(user.id)
+async def referrals_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show referrals"""
+    query = update.callback_query
+    await query.answer()
     
-    await update.message.reply_text(
-        f"💰 **Your Balance:** ₹{user_data.get('balance', 0):.2f}\n"
-        f"👥 **Referrals:** {user_data.get('referral_count', 0)}\n"
-        f"💵 **Total Earned:** ₹{user_data.get('total_earned', 0):.2f}"
+    user = update.effective_user
+    user_data = UserManager.get_user(user.id)
+    
+    message = (
+        f"👥 **Referral Program**\n\n"
+        f"📊 **Total Referrals:** {user_data['referral_count']}\n"
+        f"💰 **Earned from Referrals:** ₹{user_data['referral_count']:.2f}\n"
+        f"💵 **Earn per Referral:** ₹1.00\n\n"
+        f"**How it works:**\n"
+        f"1. Share your invite link\n"
+        f"2. Friend joins channels\n"
+        f"3. Friend starts bot\n"
+        f"4. You earn ₹1!"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("🔗 Get Invite Link", callback_data="invite_link")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
+    ]
+    
+    await query.edit_message_text(
+        text=message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
     )
 
-async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /referral command"""
+async def invite_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show invite link"""
+    query = update.callback_query
+    await query.answer()
+    
     user = update.effective_user
-    user_data = await UserManager.get_or_create_user(user.id)
+    user_data = UserManager.get_user(user.id)
     
-    referral_link = f"https://t.me/{context.bot.username}?start={user_data['referral_code']}"
+    referral_code = user_data['referral_code']
+    invite_link = f"https://t.me/{context.bot.username}?start={referral_code}"
     
-    await update.message.reply_text(
-        f"🔗 **Your Referral Link:**\n`{referral_link}`\n\n"
-        f"Share this link to earn ₹1 for each friend who joins!"
+    message = (
+        f"🔗 **Your Invite Link**\n\n"
+        f"Share this link to earn ₹1 per referral:\n\n"
+        f"`{invite_link}`\n\n"
+        f"**Your Stats:**\n"
+        f"• Referrals: {user_data['referral_count']}\n"
+        f"• Earned: ₹{user_data['referral_count'] * 1:.2f}\n\n"
+        f"**Referral Code:** `{referral_code}`"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("📤 Share Link", url=f"https://t.me/share/url?url={invite_link}&text=Join%20this%20bot%20to%20earn%20money%21")],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
+    ]
+    
+    await query.edit_message_text(
+        text=message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
     )
 
 # Admin Commands
 async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add a new channel (Admin only)"""
+    """Add channel - only UID required"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Admin only command")
-        return
-    
-    if not context.args or len(context.args) < 3:
-        await update.message.reply_text(
-            "Usage: /addchannel <chat_id> <invite_link> <title>\n"
-            "Example: /addchannel -1001234567890 https://t.me/channelname Channel Name"
-        )
-        return
-    
-    try:
-        chat_id = int(context.args[0])
-        invite_link = context.args[1]
-        title = " ".join(context.args[2:])
-        
-        success = ChannelManager.add_channel(chat_id, invite_link, title)
-        
-        if success:
-            await update.message.reply_text(f"✅ Channel added: {title}")
-        else:
-            await update.message.reply_text("❌ Failed to add channel")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid chat ID. Must be a number.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-
-async def remove_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove a channel (Admin only)"""
-    user = update.effective_user
-    
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Admin only command")
+        await update.message.reply_text("❌ Admin only")
         return
     
     if not context.args:
         await update.message.reply_text(
-            "Usage: /removechannel <chat_id>\n"
-            "Example: /removechannel -1001234567890"
+            "❌ **Usage:** `/addchannel <channel_uid>`\n\n"
+            "**Examples:**\n"
+            "`/addchannel -1001234567890`\n"
+            "`/addchannel @username`",
+            parse_mode=ParseMode.MARKDOWN
         )
         return
     
-    try:
-        chat_id = int(context.args[0])
-        
-        success = ChannelManager.remove_channel(chat_id)
-        
-        if success:
-            await update.message.reply_text(f"✅ Channel removed: {chat_id}")
-        else:
-            await update.message.reply_text("❌ Channel not found")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid chat ID")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+    chat_id = context.args[0]
+    
+    success = ChannelManager.add_channel(chat_id)
+    
+    if success:
+        await update.message.reply_text(
+            f"✅ **Channel Added!**\n\n"
+            f"**UID:** {chat_id}\n"
+            f"**Total Channels:** {len(storage.channels)}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.message.reply_text(
+            "❌ **Failed to add channel**\n\n"
+            "Possible reasons:\n"
+            "• Channel already added\n"
+            "• Invalid UID format\n"
+            "• Bot not in channel"
+        )
 
-async def list_channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all channels (Admin only)"""
+async def remove_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Remove channel"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Admin only command")
+        await update.message.reply_text("❌ Admin only")
         return
     
-    channels = ChannelManager.get_active_channels()
+    if not context.args:
+        await update.message.reply_text(
+            "❌ **Usage:** `/removechannel <channel_uid>`\n\n"
+            "**Example:** `/removechannel -1001234567890`"
+        )
+        return
+    
+    chat_id = context.args[0]
+    success = ChannelManager.remove_channel(chat_id)
+    
+    if success:
+        await update.message.reply_text(
+            f"✅ **Channel Removed!**\n\n"
+            f"**UID:** {chat_id}\n"
+            f"**Remaining:** {len(storage.channels)}"
+        )
+    else:
+        await update.message.reply_text("❌ Channel not found")
+
+async def list_channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List all channels"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only")
+        return
+    
+    channels = ChannelManager.get_channels()
     
     if not channels:
-        await update.message.reply_text("📭 No channels added yet.")
+        await update.message.reply_text("📭 No channels added")
         return
     
-    message = "📢 **Active Channels:**\n\n"
+    message = "📢 **Required Channels:**\n\n"
     for i, channel in enumerate(channels, 1):
-        message += f"{i}. {channel['title']}\n"
-        message += f"   ID: {channel['chat_id']}\n"
-        message += f"   Link: {channel['invite_link']}\n\n"
+        message += f"{i}. {channel['name']}\n"
+        message += f"   `{channel['chat_id']}`\n\n"
     
-    await update.message.reply_text(message)
+    await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
 
 async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin panel"""
@@ -658,22 +732,26 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("❌ Admin only", show_alert=True)
         return
     
-    channels = ChannelManager.get_active_channels()
+    total_users = len(storage.users)
+    total_channels = len(storage.channels)
+    total_balance = sum(u.get('balance', 0) for u in storage.users.values())
     
     message = (
         "👑 **Admin Panel**\n\n"
-        f"📢 Active Channels: {len(channels)}\n"
-        f"🤖 Bot Status: ✅ Running\n\n"
+        f"📊 **Statistics:**\n"
+        f"• Total Users: {total_users}\n"
+        f"• Total Channels: {total_channels}\n"
+        f"• Total Balance: ₹{total_balance:.2f}\n\n"
         "**Commands:**\n"
-        "• /addchannel - Add new channel\n"
-        "• /removechannel - Remove channel\n"
-        "• /listchannels - List all channels\n"
-        "• /broadcast - Send message to all users"
+        "• `/addchannel <uid>` - Add channel\n"
+        "• `/removechannel <uid>` - Remove channel\n"
+        "• `/listchannels` - List channels\n"
+        "• `/broadcast <message>` - Broadcast"
     )
     
     keyboard = [
-        [InlineKeyboardButton("📢 Manage Channels", callback_data="manage_channels")],
-        [InlineKeyboardButton("👥 View Users", callback_data="view_users")],
+        [InlineKeyboardButton("📢 Channels", callback_data="admin_channels")],
+        [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
     ]
     
@@ -683,8 +761,8 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def manage_channels_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manage channels interface"""
+async def admin_channels_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin channel management"""
     query = update.callback_query
     await query.answer()
     
@@ -694,134 +772,166 @@ async def manage_channels_callback(update: Update, context: ContextTypes.DEFAULT
         await query.answer("❌ Admin only", show_alert=True)
         return
     
-    channels = ChannelManager.get_active_channels()
+    channels = ChannelManager.get_channels()
     
-    message = "📢 **Manage Channels**\n\n"
+    message = f"📢 **Channel Management**\n\nTotal: {len(channels)}\n\n"
     
     keyboard = []
-    for channel in channels[:10]:  # Show first 10
+    for channel in channels:
         keyboard.append([
             InlineKeyboardButton(
-                f"❌ {channel['title'][:20]}",
-                callback_data=f"remove_channel_{channel['chat_id']}"
+                f"❌ Remove {channel['name'][:15]}",
+                callback_data=f"admin_remove_{channel['chat_id']}"
             )
         ])
     
-    keyboard.append([InlineKeyboardButton("➕ Add New", callback_data="add_channel_info")])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
+    keyboard.extend([
+        [InlineKeyboardButton("➕ Add Channel", callback_data="admin_add_info")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="admin_channels")],
+        [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
+    ])
     
     await query.edit_message_text(
         text=message,
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle admin callbacks"""
     query = update.callback_query
     await query.answer()
     
     data = query.data
     
-    if data.startswith("remove_channel_"):
-        try:
-            chat_id = int(data.split("_")[-1])
-            success = ChannelManager.remove_channel(chat_id)
-            
-            if success:
-                await query.answer("✅ Channel removed", show_alert=True)
-                await manage_channels_callback(update, context)
-            else:
-                await query.answer("❌ Failed to remove", show_alert=True)
-        except:
-            await query.answer("❌ Error", show_alert=True)
+    if data.startswith("admin_remove_"):
+        chat_id = data.replace("admin_remove_", "", 1)
+        success = ChannelManager.remove_channel(chat_id)
+        
+        if success:
+            await query.answer("✅ Channel removed", show_alert=True)
+            await admin_channels_callback(update, context)
+        else:
+            await query.answer("❌ Failed", show_alert=True)
     
-    elif data == "add_channel_info":
+    elif data == "admin_add_info":
         await query.edit_message_text(
-            text="To add a channel:\n\n"
-                 "Use command:\n"
-                 "`/addchannel <chat_id> <invite_link> <title>`\n\n"
-                 "Example:\n"
-                 "`/addchannel -1001234567890 https://t.me/mychannel My Channel`",
+            text="**Add Channel**\n\n"
+                 "Use command: `/addchannel <uid>`\n\n"
+                 "**Examples:**\n"
+                 "`/addchannel -1001234567890`\n"
+                 "`/addchannel @username`\n\n"
+                 "Bot will auto-create invite links.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="manage_channels")]
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_channels")]
             ])
         )
     
-    elif data == "view_users":
-        if users_collection is not None:
-            user_count = users_collection.count_documents({})
-            await query.edit_message_text(
-                text=f"👥 **Total Users:** {user_count}",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-                ])
-            )
-        else:
-            await query.edit_message_text(
-                text="👥 **Users:** Database not connected",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-                ])
-            )
+    elif data == "admin_stats":
+        total_users = len(storage.users)
+        total_channels = len(storage.channels)
+        total_balance = sum(u.get('balance', 0) for u in storage.users.values())
+        total_earned = sum(u.get('total_earned', 0) for u in storage.users.values())
+        
+        await query.edit_message_text(
+            text=f"📊 **Statistics**\n\n"
+                 f"👥 Users: {total_users}\n"
+                 f"📢 Channels: {total_channels}\n"
+                 f"💰 Total Balance: ₹{total_balance:.2f}\n"
+                 f"💵 Total Earned: ₹{total_earned:.2f}\n"
+                 f"👥 Total Referrals: {sum(u.get('referral_count', 0) for u in storage.users.values())}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
+            ])
+        )
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Broadcast message to all users (Admin only)"""
+    """Broadcast message to all users"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Admin only command")
+        await update.message.reply_text("❌ Admin only")
         return
     
     if not context.args:
-        await update.message.reply_text("Usage: /broadcast <message>")
+        await update.message.reply_text("❌ Usage: `/broadcast <message>`")
         return
     
     message = " ".join(context.args)
+    sent_count = 0
     
-    if users_collection is not None:
-        users = users_collection.find({})
-        count = 0
-        
-        for user_doc in users:
-            try:
-                await context.bot.send_message(
-                    chat_id=user_doc['user_id'],
-                    text=f"📢 **Announcement:**\n\n{message}"
-                )
-                count += 1
-            except:
-                pass
-        
-        await update.message.reply_text(f"✅ Broadcast sent to {count} users")
-    else:
-        await update.message.reply_text("❌ User database not available")
+    await update.message.reply_text(f"📢 Broadcasting to {len(storage.users)} users...")
+    
+    for user_id_str in storage.users:
+        try:
+            await context.bot.send_message(
+                chat_id=int(user_id_str),
+                text=f"📢 **Announcement:**\n\n{message}"
+            )
+            sent_count += 1
+        except:
+            continue
+    
+    await update.message.reply_text(f"✅ Sent to {sent_count}/{len(storage.users)} users")
 
-# Clean message handler
-async def clean_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Clean command messages"""
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show help"""
+    await update.message.reply_text(
+        "❓ **Help**\n\n"
+        "**Commands:**\n"
+        "• /start - Start bot\n"
+        "• /withdraw - Withdraw money\n"
+        "• /help - Show this message\n\n"
+        "**How to Earn:**\n"
+        "• Join required channels\n"
+        "• Share your invite link\n"
+        "• Earn ₹1 per referral\n\n"
+        "**Withdrawal:**\n"
+        "• Minimum: ₹10\n"
+        "• Methods: UPI, Paytm, PhonePe, Bank\n"
+        "• Processing: 24 hours"
+    )
+
+# Simple HTTP server for Render health checks
+def run_http_server():
+    """Run a simple HTTP server for health checks"""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Bot is running')
+        
+        def log_message(self, format, *args):
+            pass  # Disable logging
+    
     try:
-        if update.message:
-            await update.message.delete()
-    except:
-        pass
+        server = HTTPServer(('0.0.0.0', PORT), HealthHandler)
+        logger.info(f"✅ HTTP server running on port {PORT}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"❌ HTTP server failed: {e}")
 
 def main():
     """Start the bot"""
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not set")
-        print("Please set BOT_TOKEN environment variable")
+        print("ERROR: Please set BOT_TOKEN environment variable")
         return
+    
+    # Start HTTP server in background thread (for Render health checks)
+    http_thread = threading.Thread(target=run_http_server, daemon=True)
+    http_thread.start()
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("balance", balance_command))
-    application.add_handler(CommandHandler("referral", referral_command))
     application.add_handler(CommandHandler("withdraw", withdraw_command))
-    application.add_handler(CommandHandler("help", help_callback))
+    application.add_handler(CommandHandler("help", help_command))
     
     # Admin commands
     application.add_handler(CommandHandler("addchannel", add_channel_command))
@@ -829,26 +939,34 @@ def main():
     application.add_handler(CommandHandler("listchannels", list_channels_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     
-    # Callback query handlers
-    application.add_handler(CallbackQueryHandler(check_membership_callback, pattern="^check_membership$"))
+    # Callback handlers
+    application.add_handler(CallbackQueryHandler(verify_join_callback, pattern="^verify_join$"))
     application.add_handler(CallbackQueryHandler(show_main_menu_callback, pattern="^back_to_main$"))
-    application.add_handler(CallbackQueryHandler(view_channels_callback, pattern="^view_channels$"))
-    application.add_handler(CallbackQueryHandler(my_referrals_callback, pattern="^my_referrals$"))
+    application.add_handler(CallbackQueryHandler(show_main_menu_callback, pattern="^refresh$"))
+    application.add_handler(CallbackQueryHandler(balance_callback, pattern="^balance$"))
     application.add_handler(CallbackQueryHandler(withdraw_callback, pattern="^withdraw$"))
-    application.add_handler(CallbackQueryHandler(help_callback, pattern="^help$"))
+    application.add_handler(CallbackQueryHandler(history_callback, pattern="^history$"))
+    application.add_handler(CallbackQueryHandler(referrals_callback, pattern="^referrals$"))
+    application.add_handler(CallbackQueryHandler(invite_link_callback, pattern="^invite_link$"))
     application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^admin_panel$"))
-    application.add_handler(CallbackQueryHandler(manage_channels_callback, pattern="^manage_channels$"))
-    application.add_handler(CallbackQueryHandler(handle_admin_callback, pattern="^(remove_channel_|add_channel_info|view_users)$"))
-    
-    # Message handler for cleanup
-    application.add_handler(MessageHandler(filters.COMMAND, clean_message))
+    application.add_handler(CallbackQueryHandler(admin_channels_callback, pattern="^admin_channels$"))
+    application.add_handler(CallbackQueryHandler(admin_handle_callback, pattern="^admin_"))
     
     # Start bot
     logger.info("🤖 Bot is starting...")
-    print("✅ Bot is running!")
+    print(f"✅ Bot started!")
     print(f"👑 Admin IDs: {ADMIN_IDS}")
+    print(f"📢 Channels: {len(storage.channels)}")
+    print(f"👥 Users: {len(storage.users)}")
+    print(f"🌐 HTTP Server: http://0.0.0.0:{PORT}")
     
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+    except Exception as e:
+        logger.error(f"Bot stopped with error: {e}")
 
 if __name__ == '__main__':
     main()
