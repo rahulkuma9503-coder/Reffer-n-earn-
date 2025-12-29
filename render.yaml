@@ -1,18 +1,17 @@
 services:
   - type: web
     name: telegram-referral-bot
-    env: docker
-    dockerfilePath: ./Dockerfile
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: MONGODB_URI
-        value: mongodb+srv://user:pass@cluster.mongodb.net/telegram_bot
-        sync: false
-      - key: REDIS_URL
-        value: redis://red-xxxxx:6379
-        sync: false
       - key: ADMIN_IDS
         sync: false
-    healthCheckPath: /health
+      - key: PORT
+        value: 8080
+      - key: MONGODB_URI
+        sync: false
+    healthCheckPath: /
     autoDeploy: true
