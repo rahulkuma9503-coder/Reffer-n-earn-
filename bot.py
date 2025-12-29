@@ -1391,11 +1391,20 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_handle_callback, pattern="^admin_"))
     application.add_handler(CallbackQueryHandler(confirm_reset_callback, pattern="^confirm_reset$"))
     
+    # Try to get bot info, but handle if not available yet
+    try:
+        # Try to get bot info
+        bot_info = application.bot.get_me()
+        bot_username = bot_info.username
+    except Exception as e:
+        logger.warning(f"Could not fetch bot username: {e}")
+        bot_username = "unknown"
+    
     # Start bot
     logger.info("🤖 Bot is starting...")
     print("=" * 50)
     print(f"✅ Bot started successfully!")
-    print(f"🤖 Bot username: @{application.bot.username}")
+    print(f"🤖 Bot username: @{bot_username}")
     print(f"👑 Admin IDs: {ADMIN_IDS}")
     print(f"📢 Channels: {len(data_manager.channels)}")
     print(f"👥 Users: {len(data_manager.users)}")
