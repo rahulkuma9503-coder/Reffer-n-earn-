@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import List, Dict
 import json
 import threading
+import atexit
 from dotenv import load_dotenv
 
 from telegram import (
@@ -21,6 +22,8 @@ from telegram.ext import (
     filters
 )
 from telegram.constants import ParseMode
+import pymongo
+from pymongo import MongoClient
 
 # Load environment variables
 load_dotenv()
@@ -36,55 +39,191 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS', '').split(','))) if os.getenv('ADMIN_IDS') else []
 PORT = int(os.getenv('PORT', 8080))
+MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
 
-# Simple in-memory storage
+# Connect to MongoDB
+try:
+    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    db = client['telegram_referral_bot']
+    
+    # Test connection
+    client.server_info()
+    logger.info("✅ MongoDB connected successfully")
+    
+    # Collections
+    channels_collection = db['channels']
+    users_collection = db['users']
+    referrals_collection = db['referrals']
+    
+    # Create indexes
+    users_collection.create_index('user_id', unique=True)
+    channels_collection.create_index('chat_id', unique=True)
+    referrals_collection.create_index([('referrer_id', 1), ('referred_id', 1)], unique=True)
+    
+except Exception as e:
+    logger.error(f"❌ MongoDB connection failed: {e}")
+    # Fallback to local files (for testing only)
+    db = None
+
 class Storage:
-    def __init__(self):
-        self.channels = []  # Format: {'chat_id': str, 'name': str}
-        self.users = {}     # Format: {user_id: {user_data}}
-        self.referrals = {} # Format: {referred_user_id: referrer_user_id}
-        self.load_data()
+    """Database storage manager"""
     
-    def load_data(self):
-        """Load data from files"""
+    @staticmethod
+    def save_channels(channels: List[Dict]):
+        """Save channels to MongoDB"""
         try:
-            if os.path.exists('channels.json'):
-                with open('channels.json', 'r') as f:
-                    self.channels = json.load(f)
-            
-            if os.path.exists('users.json'):
-                with open('users.json', 'r') as f:
-                    self.users = json.load(f)
-            
-            if os.path.exists('referrals.json'):
-                with open('referrals.json', 'r') as f:
-                    self.referrals = json.load(f)
-        except:
-            pass
-    
-    def save_data(self):
-        """Save data to files"""
-        try:
-            with open('channels.json', 'w') as f:
-                json.dump(self.channels, f)
-            
-            with open('users.json', 'w') as f:
-                json.dump(self.users, f)
-            
-            with open('referrals.json', 'w') as f:
-                json.dump(self.referrals, f)
+            if db:
+                channels_collection.delete_many({})
+                if channels:
+                    channels_collection.insert_many(channels)
+            else:
+                # Fallback to file
+                with open('channels_backup.json', 'w') as f:
+                    json.dump(channels, f)
         except Exception as e:
-            logger.error(f"Error saving data: {e}")
+            logger.error(f"Error saving channels: {e}")
+    
+    @staticmethod
+    def load_channels() -> List[Dict]:
+        """Load channels from MongoDB"""
+        try:
+            if db:
+                return list(channels_collection.find({}, {'_id': 0}))
+            else:
+                # Fallback from file
+                if os.path.exists('channels_backup.json'):
+                    with open('channels_backup.json', 'r') as f:
+                        return json.load(f)
+                return []
+        except Exception as e:
+            logger.error(f"Error loading channels: {e}")
+            return []
+    
+    @staticmethod
+    def save_users(users: Dict):
+        """Save users to MongoDB"""
+        try:
+            if db:
+                for user_id, user_data in users.items():
+                    users_collection.update_one(
+                        {'user_id': int(user_id)},
+                        {'$set': user_data},
+                        upsert=True
+                    )
+            else:
+                # Fallback to file
+                with open('users_backup.json', 'w') as f:
+                    json.dump(users, f)
+        except Exception as e:
+            logger.error(f"Error saving users: {e}")
+    
+    @staticmethod
+    def load_users() -> Dict:
+        """Load users from MongoDB"""
+        try:
+            if db:
+                users = {}
+                for user in users_collection.find({}, {'_id': 0}):
+                    users[str(user['user_id'])] = user
+                return users
+            else:
+                # Fallback from file
+                if os.path.exists('users_backup.json'):
+                    with open('users_backup.json', 'r') as f:
+                        return json.load(f)
+                return {}
+        except Exception as e:
+            logger.error(f"Error loading users: {e}")
+            return {}
+    
+    @staticmethod
+    def save_referrals(referrals: Dict):
+        """Save referrals to MongoDB"""
+        try:
+            if db:
+                referrals_collection.delete_many({})
+                referrals_list = []
+                for referred_id, referrer_id in referrals.items():
+                    referrals_list.append({
+                        'referred_id': int(referred_id),
+                        'referrer_id': int(referrer_id),
+                        'created_at': datetime.now()
+                    })
+                if referrals_list:
+                    referrals_collection.insert_many(referrals_list)
+            else:
+                # Fallback to file
+                with open('referrals_backup.json', 'w') as f:
+                    json.dump(referrals, f)
+        except Exception as e:
+            logger.error(f"Error saving referrals: {e}")
+    
+    @staticmethod
+    def load_referrals() -> Dict:
+        """Load referrals from MongoDB"""
+        try:
+            if db:
+                referrals = {}
+                for ref in referrals_collection.find({}, {'_id': 0}):
+                    referrals[str(ref['referred_id'])] = str(ref['referrer_id'])
+                return referrals
+            else:
+                # Fallback from file
+                if os.path.exists('referrals_backup.json'):
+                    with open('referrals_backup.json', 'r') as f:
+                        return json.load(f)
+                return {}
+        except Exception as e:
+            logger.error(f"Error loading referrals: {e}")
+            return {}
 
-# Global storage
-storage = Storage()
+class DataManager:
+    """Manage all data with MongoDB persistence"""
+    
+    def __init__(self):
+        self.channels = []
+        self.users = {}
+        self.referrals = {}
+        self.load_all_data()
+        
+        # Backup data on exit
+        atexit.register(self.backup_all_data)
+    
+    def load_all_data(self):
+        """Load all data from database"""
+        logger.info("📂 Loading data from database...")
+        self.channels = Storage.load_channels()
+        self.users = Storage.load_users()
+        self.referrals = Storage.load_referrals()
+        logger.info(f"✅ Loaded {len(self.channels)} channels, {len(self.users)} users, {len(self.referrals)} referrals")
+    
+    def backup_all_data(self):
+        """Backup all data to database"""
+        logger.info("💾 Backing up data to database...")
+        Storage.save_channels(self.channels)
+        Storage.save_users(self.users)
+        Storage.save_referrals(self.referrals)
+        logger.info(f"✅ Data backed up: {len(self.channels)} channels, {len(self.users)} users, {len(self.referrals)} referrals")
+    
+    def get_stats(self) -> str:
+        """Get data statistics"""
+        return (
+            f"📊 **Database Statistics:**\n\n"
+            f"📢 Channels: {len(self.channels)}\n"
+            f"👥 Users: {len(self.users)}\n"
+            f"🔗 Referrals: {len(self.referrals)}\n"
+            f"💰 Total Balance: ₹{sum(u.get('balance', 0) for u in self.users.values()):.2f}"
+        )
+
+# Global data manager
+data_manager = DataManager()
 
 class ChannelManager:
     """Manage channels"""
     
     @staticmethod
     def get_channels() -> List[Dict]:
-        return storage.channels
+        return data_manager.channels
     
     @staticmethod
     def add_channel(chat_id: str) -> bool:
@@ -103,18 +242,18 @@ class ChannelManager:
                     return False
             
             # Check duplicate
-            for channel in storage.channels:
+            for channel in data_manager.channels:
                 if str(channel.get('chat_id')) == str(chat_id_str):
                     return False
             
             # Add channel
             channel = {
                 'chat_id': chat_id_str,
-                'name': f"Join Channel {len(storage.channels) + 1}",
+                'name': f"Channel {len(data_manager.channels) + 1}",
                 'added_at': datetime.now().isoformat()
             }
-            storage.channels.append(channel)
-            storage.save_data()
+            data_manager.channels.append(channel)
+            Storage.save_channels(data_manager.channels)
             return True
         except Exception as e:
             logger.error(f"Error adding channel: {e}")
@@ -123,14 +262,14 @@ class ChannelManager:
     @staticmethod
     def remove_channel(chat_id: str) -> bool:
         try:
-            original_count = len(storage.channels)
-            storage.channels = [
-                c for c in storage.channels 
+            original_count = len(data_manager.channels)
+            data_manager.channels = [
+                c for c in data_manager.channels 
                 if str(c.get('chat_id')) != str(chat_id.strip())
             ]
             
-            if len(storage.channels) < original_count:
-                storage.save_data()
+            if len(data_manager.channels) < original_count:
+                Storage.save_channels(data_manager.channels)
                 return True
             return False
         except Exception as e:
@@ -138,14 +277,14 @@ class ChannelManager:
             return False
 
 class UserManager:
-    """Manage users with fixed referral system"""
+    """Manage users with MongoDB"""
     
     @staticmethod
     def get_user(user_id: int) -> Dict:
         user_str = str(user_id)
         
-        if user_str in storage.users:
-            return storage.users[user_str]
+        if user_str in data_manager.users:
+            return data_manager.users[user_str]
         
         # Create new user
         user_data = {
@@ -161,17 +300,17 @@ class UserManager:
             'has_joined_channels': False
         }
         
-        storage.users[user_str] = user_data
-        storage.save_data()
+        data_manager.users[user_str] = user_data
+        Storage.save_users(data_manager.users)
         return user_data
     
     @staticmethod
     def update_user(user_id: int, updates: Dict):
         user_str = str(user_id)
-        if user_str in storage.users:
-            storage.users[user_str].update(updates)
-            storage.users[user_str]['last_active'] = datetime.now().isoformat()
-            storage.save_data()
+        if user_str in data_manager.users:
+            data_manager.users[user_str].update(updates)
+            data_manager.users[user_str]['last_active'] = datetime.now().isoformat()
+            Storage.save_users(data_manager.users)
     
     @staticmethod
     def add_transaction(user_id: int, amount: float, tx_type: str, description: str):
@@ -197,34 +336,31 @@ class UserManager:
     
     @staticmethod
     def is_referred(user_id: int) -> bool:
-        """Check if user was referred by someone"""
         user_str = str(user_id)
-        return user_str in storage.referrals
+        return user_str in data_manager.referrals
     
     @staticmethod
     def get_referrer(user_id: int) -> int:
-        """Get referrer of a user"""
         user_str = str(user_id)
-        if user_str in storage.referrals:
-            return int(storage.referrals[user_str])
+        if user_str in data_manager.referrals:
+            return int(data_manager.referrals[user_str])
         return None
     
     @staticmethod
     def add_referral(referrer_id: int, referred_id: int) -> bool:
-        """Add a referral - returns True if new referral, False if duplicate"""
         if referrer_id == referred_id:
             return False
         
         referred_str = str(referred_id)
         
         # Check if already referred
-        if referred_str in storage.referrals:
-            logger.info(f"User {referred_id} already referred by {storage.referrals[referred_str]}")
+        if referred_str in data_manager.referrals:
+            logger.info(f"User {referred_id} already referred by {data_manager.referrals[referred_str]}")
             return False
         
         # Record referral
-        storage.referrals[referred_str] = str(referrer_id)
-        storage.save_data()
+        data_manager.referrals[referred_str] = str(referrer_id)
+        Storage.save_referrals(data_manager.referrals)
         
         # Update referrer's stats
         referrer = UserManager.get_user(referrer_id)
@@ -246,9 +382,13 @@ class UserManager:
         
         logger.info(f"New referral: {referrer_id} → {referred_id}")
         return True
+    
+    @staticmethod
+    def get_all_users() -> List[Dict]:
+        """Get all users for admin"""
+        return list(data_manager.users.values())
 
 async def check_channel_membership(bot, user_id: int) -> tuple:
-    """Check if user is member of all channels"""
     channels = ChannelManager.get_channels()
     
     if not channels:
@@ -269,7 +409,6 @@ async def check_channel_membership(bot, user_id: int) -> tuple:
     return len(not_joined) == 0, not_joined
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command with fixed referral system"""
     user = update.effective_user
     user_data = UserManager.get_user(user.id)
     
@@ -287,19 +426,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # Find referrer by code
             referrer_found = None
-            for user_id_str, user_data in storage.users.items():
+            for user_id_str, user_data in data_manager.users.items():
                 if user_data.get('referral_code') == referral_code:
                     referrer_found = int(user_id_str)
                     break
             
             if referrer_found and referrer_found != user.id:
-                # Add referral (prevents duplicates)
                 is_new_referral = UserManager.add_referral(referrer_found, user.id)
                 
                 if is_new_referral:
                     # Notify referrer
                     try:
-                        referrer_name = user.first_name
                         await context.bot.send_message(
                             chat_id=referrer_found,
                             text=f"🎉 **New Referral!**\n\n"
@@ -334,7 +471,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update, context)
 
 async def show_join_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, not_joined: List[Dict]):
-    """Show join buttons"""
     user = update.effective_user
     
     keyboard = []
@@ -375,7 +511,6 @@ async def show_join_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     )
 
 async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Verify join"""
     query = update.callback_query
     await query.answer()
     
@@ -426,7 +561,6 @@ async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show main menu"""
     user = update.effective_user
     user_data = UserManager.get_user(user.id)
     
@@ -466,11 +600,9 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def show_main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show main menu from callback"""
     await show_main_menu(update, context)
 
 async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show balance"""
     query = update.callback_query
     await query.answer()
     
@@ -494,7 +626,6 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def withdraw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Withdraw menu"""
     query = update.callback_query
     await query.answer()
     
@@ -521,7 +652,6 @@ async def withdraw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle withdrawal"""
     user = update.effective_user
     user_data = UserManager.get_user(user.id)
     
@@ -546,7 +676,6 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Insufficient balance")
             return
         
-        # Process withdrawal
         new_balance = user_data['balance'] - amount
         UserManager.update_user(user.id, {
             'balance': new_balance,
@@ -588,7 +717,6 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid amount")
 
 async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Transaction history"""
     query = update.callback_query
     await query.answer()
     
@@ -615,16 +743,15 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def referrals_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Referral stats"""
     query = update.callback_query
     await query.answer()
     
     user = update.effective_user
     user_data = UserManager.get_user(user.id)
     
-    # Get list of users referred by this user
+    # Get referred users
     referred_users = []
-    for referred_str, referrer_str in storage.referrals.items():
+    for referred_str, referrer_str in data_manager.referrals.items():
         if referrer_str == str(user.id):
             referred_user_id = int(referred_str)
             referred_user = UserManager.get_user(referred_user_id)
@@ -664,7 +791,6 @@ async def referrals_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 async def invite_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Invite link"""
     query = update.callback_query
     await query.answer()
     
@@ -702,7 +828,6 @@ async def invite_link_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # Admin Commands
 async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add channel"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
@@ -726,14 +851,13 @@ async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(
             f"✅ **Channel Added!**\n\n"
             f"**UID:** {chat_id}\n"
-            f"**Total Channels:** {len(storage.channels)}",
+            f"**Total Channels:** {len(data_manager.channels)}",
             parse_mode=ParseMode.MARKDOWN
         )
     else:
         await update.message.reply_text("❌ Failed to add channel")
 
 async def remove_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove channel"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
@@ -754,13 +878,12 @@ async def remove_channel_command(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(
             f"✅ **Channel Removed!**\n\n"
             f"**UID:** {chat_id}\n"
-            f"**Remaining:** {len(storage.channels)}"
+            f"**Remaining:** {len(data_manager.channels)}"
         )
     else:
         await update.message.reply_text("❌ Channel not found")
 
 async def list_channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List channels"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
@@ -780,8 +903,42 @@ async def list_channels_command(update: Update, context: ContextTypes.DEFAULT_TY
     
     await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
 
-async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin panel"""
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Restart bot or clear data (Admin only)"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only")
+        return
+    
+    # Check for reset flag
+    if context.args and context.args[0].lower() == 'reset':
+        keyboard = [
+            [InlineKeyboardButton("✅ Yes, Reset All Data", callback_data="confirm_reset")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_panel")]
+        ]
+        
+        await update.message.reply_text(
+            "⚠️ **WARNING: Data Reset**\n\n"
+            "This will delete ALL data:\n"
+            "• All users and balances\n"
+            "• All channels\n"
+            "• All referral records\n\n"
+            "**This action cannot be undone!**\n\n"
+            "Are you sure you want to reset all data?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update.message.reply_text(
+            "🔄 **Restart Options**\n\n"
+            "Usage:\n"
+            "• `/restart` - Show this menu\n"
+            "• `/restart reset` - Reset all data\n\n"
+            "**Note:** Bot will continue running, only data will be cleared."
+        )
+
+async def confirm_reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm and reset all data"""
     query = update.callback_query
     await query.answer()
     
@@ -791,29 +948,85 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("❌ Admin only", show_alert=True)
         return
     
-    total_users = len(storage.users)
-    total_channels = len(storage.channels)
-    total_balance = sum(u.get('balance', 0) for u in storage.users.values())
-    total_referrals = len(storage.referrals)
+    # Reset all data
+    data_manager.channels.clear()
+    data_manager.users.clear()
+    data_manager.referrals.clear()
+    
+    # Save empty data
+    Storage.save_channels([])
+    Storage.save_users({})
+    Storage.save_referrals({})
+    
+    await query.edit_message_text(
+        "✅ **All Data Reset!**\n\n"
+        "• Users: 0\n"
+        "• Channels: 0\n"
+        "• Referrals: 0\n\n"
+        "Bot is now fresh and clean."
+    )
+    
+    # Log the reset
+    logger.warning(f"Admin {user.id} reset all bot data")
+
+async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Backup data to files (Admin only)"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only")
+        return
+    
+    # Force backup
+    data_manager.backup_all_data()
+    
+    stats = data_manager.get_stats()
+    await update.message.reply_text(
+        f"✅ **Data Backup Complete!**\n\n{stats}\n\n"
+        f"Data is safely stored in MongoDB."
+    )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot statistics (Admin only)"""
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only")
+        return
+    
+    stats = data_manager.get_stats()
+    await update.message.reply_text(stats, parse_mode=ParseMode.MARKDOWN)
+
+async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user = update.effective_user
+    
+    if user.id not in ADMIN_IDS:
+        await query.answer("❌ Admin only", show_alert=True)
+        return
+    
+    stats = data_manager.get_stats()
     
     message = (
-        "👑 **Admin Panel**\n\n"
-        f"📊 **Statistics:**\n"
-        f"• Total Users: {total_users}\n"
-        f"• Total Channels: {total_channels}\n"
-        f"• Total Balance: ₹{total_balance:.2f}\n"
-        f"• Total Referrals: {total_referrals}\n\n"
+        f"👑 **Admin Panel**\n\n"
+        f"{stats}\n\n"
         "**Commands:**\n"
         "• `/addchannel <uid>` - Add channel\n"
         "• `/removechannel <uid>` - Remove channel\n"
         "• `/listchannels` - List channels\n"
-        "• `/broadcast <message>` - Broadcast"
+        "• `/broadcast <message>` - Broadcast\n"
+        "• `/restart` - Restart options\n"
+        "• `/backup` - Backup data\n"
+        "• `/stats` - Show statistics"
     )
     
     keyboard = [
         [InlineKeyboardButton("📢 Channels", callback_data="admin_channels")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
-        [InlineKeyboardButton("👥 Users", callback_data="admin_users")],
+        [InlineKeyboardButton("💾 Backup", callback_data="admin_backup")],
+        [InlineKeyboardButton("🔄 Restart", callback_data="admin_restart")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]
     ]
     
@@ -824,7 +1037,6 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def admin_channels_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin channels"""
     query = update.callback_query
     await query.answer()
     
@@ -859,7 +1071,6 @@ async def admin_channels_callback(update: Update, context: ContextTypes.DEFAULT_
     )
 
 async def admin_handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle admin callbacks"""
     query = update.callback_query
     await query.answer()
     
@@ -889,42 +1100,36 @@ async def admin_handle_callback(update: Update, context: ContextTypes.DEFAULT_TY
         )
     
     elif data == "admin_stats":
-        total_users = len(storage.users)
-        total_channels = len(storage.channels)
-        total_balance = sum(u.get('balance', 0) for u in storage.users.values())
-        total_earned = sum(u.get('total_earned', 0) for u in storage.users.values())
-        total_referrals = len(storage.referrals)
-        
+        stats = data_manager.get_stats()
         await query.edit_message_text(
-            text=f"📊 **Statistics**\n\n"
-                 f"👥 Users: {total_users}\n"
-                 f"📢 Channels: {total_channels}\n"
-                 f"💰 Total Balance: ₹{total_balance:.2f}\n"
-                 f"💵 Total Earned: ₹{total_earned:.2f}\n"
-                 f"👥 Total Referrals: {total_referrals}",
+            text=stats,
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
             ])
         )
     
-    elif data == "admin_users":
-        total_users = len(storage.users)
-        active_users = sum(1 for u in storage.users.values() 
-                          if 'last_active' in u and 
-                          (datetime.now() - datetime.fromisoformat(u['last_active'])).days < 7)
-        
+    elif data == "admin_backup":
+        data_manager.backup_all_data()
         await query.edit_message_text(
-            text=f"👥 **Users**\n\n"
-                 f"📊 Total Users: {total_users}\n"
-                 f"🎯 Active (7 days): {active_users}\n\n"
-                 "Use `/broadcast` to message all users.",
+            text="✅ **Backup Complete!**\n\nAll data saved to database.",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
+            ])
+        )
+    
+    elif data == "admin_restart":
+        await query.edit_message_text(
+            text="🔄 **Restart Options**\n\n"
+                 "Use command: `/restart` for options.\n"
+                 "Or `/restart reset` to reset all data.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Reset Data", callback_data="confirm_reset")],
                 [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
             ])
         )
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Broadcast message"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
@@ -938,9 +1143,9 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = " ".join(context.args)
     sent_count = 0
     
-    await update.message.reply_text(f"📢 Broadcasting to {len(storage.users)} users...")
+    await update.message.reply_text(f"📢 Broadcasting to {len(data_manager.users)} users...")
     
-    for user_id_str in storage.users:
+    for user_id_str in data_manager.users:
         try:
             await context.bot.send_message(
                 chat_id=int(user_id_str),
@@ -950,10 +1155,9 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             continue
     
-    await update.message.reply_text(f"✅ Sent to {sent_count}/{len(storage.users)} users")
+    await update.message.reply_text(f"✅ Sent to {sent_count}/{len(data_manager.users)} users")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Help"""
     await update.message.reply_text(
         "❓ **Help**\n\n"
         "**Commands:**\n"
@@ -972,7 +1176,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Simple HTTP server for Render
 def run_http_server():
-    """Run HTTP server for health checks"""
     from http.server import HTTPServer, BaseHTTPRequestHandler
     
     class HealthHandler(BaseHTTPRequestHandler):
@@ -980,7 +1183,8 @@ def run_http_server():
             self.send_response(200)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
-            self.wfile.write(b'Bot is running')
+            response = f"Bot is running\nUsers: {len(data_manager.users)}\nChannels: {len(data_manager.channels)}"
+            self.wfile.write(response.encode())
         
         def log_message(self, format, *args):
             pass
@@ -993,7 +1197,6 @@ def run_http_server():
         logger.error(f"❌ HTTP server failed: {e}")
 
 def main():
-    """Start bot"""
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not set")
         print("ERROR: Set BOT_TOKEN environment variable")
@@ -1010,6 +1213,9 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("withdraw", withdraw_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("restart", restart_command))
+    application.add_handler(CommandHandler("backup", backup_command))
+    application.add_handler(CommandHandler("stats", stats_command))
     
     # Admin commands
     application.add_handler(CommandHandler("addchannel", add_channel_command))
@@ -1029,15 +1235,17 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^admin_panel$"))
     application.add_handler(CallbackQueryHandler(admin_channels_callback, pattern="^admin_channels$"))
     application.add_handler(CallbackQueryHandler(admin_handle_callback, pattern="^admin_"))
+    application.add_handler(CallbackQueryHandler(confirm_reset_callback, pattern="^confirm_reset$"))
     
     # Start bot
     logger.info("🤖 Bot is starting...")
     print(f"✅ Bot started!")
     print(f"👑 Admin IDs: {ADMIN_IDS}")
-    print(f"📢 Channels: {len(storage.channels)}")
-    print(f"👥 Users: {len(storage.users)}")
-    print(f"🔗 Referrals: {len(storage.referrals)}")
+    print(f"📢 Channels: {len(data_manager.channels)}")
+    print(f"👥 Users: {len(data_manager.users)}")
+    print(f"🔗 Referrals: {len(data_manager.referrals)}")
     print(f"🌐 HTTP Server: http://0.0.0.0:{PORT}")
+    print(f"💾 Database: {'✅ MongoDB' if db else '❌ Local files'}")
     
     try:
         application.run_polling(
