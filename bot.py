@@ -23,7 +23,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 import pymongo
-from pymongo import MongoClient
+from pymongo import MongoClient, errors
 
 # Load environment variables
 load_dotenv()
@@ -41,54 +41,84 @@ ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS', '').split(','))) if os.getenv('
 PORT = int(os.getenv('PORT', 8080))
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
 
-# Connect to MongoDB
-try:
-    client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-    db = client['telegram_referral_bot']
+# Global variables for database
+mongo_client = None
+channels_collection = None
+users_collection = None
+referrals_collection = None
+
+def init_database():
+    """Initialize MongoDB connection"""
+    global mongo_client, channels_collection, users_collection, referrals_collection
     
-    # Test connection
-    client.server_info()
-    logger.info("✅ MongoDB connected successfully")
+    if not MONGODB_URI:
+        logger.warning("⚠️ MONGODB_URI not set. Using file-based storage.")
+        return False
     
-    # Collections
-    channels_collection = db['channels']
-    users_collection = db['users']
-    referrals_collection = db['referrals']
-    
-    # Create indexes
-    users_collection.create_index('user_id', unique=True)
-    channels_collection.create_index('chat_id', unique=True)
-    referrals_collection.create_index([('referrer_id', 1), ('referred_id', 1)], unique=True)
-    
-except Exception as e:
-    logger.error(f"❌ MongoDB connection failed: {e}")
-    # Fallback to local files (for testing only)
-    db = None
+    try:
+        mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        # Test connection
+        mongo_client.server_info()
+        
+        db = mongo_client.get_database('telegram_referral_bot')
+        
+        # Initialize collections
+        channels_collection = db['channels']
+        users_collection = db['users']
+        referrals_collection = db['referrals']
+        
+        # Create indexes
+        users_collection.create_index('user_id', unique=True)
+        channels_collection.create_index('chat_id', unique=True)
+        referrals_collection.create_index([('referrer_id', 1), ('referred_id', 1)], unique=True)
+        
+        logger.info("✅ MongoDB connected successfully")
+        return True
+        
+    except errors.ServerSelectionTimeoutError:
+        logger.error("❌ MongoDB connection timeout. Using file-based storage.")
+        return False
+    except errors.ConnectionFailure:
+        logger.error("❌ MongoDB connection failed. Using file-based storage.")
+        return False
+    except Exception as e:
+        logger.error(f"❌ MongoDB error: {e}. Using file-based storage.")
+        return False
+
+# Initialize database
+db_connected = init_database()
 
 class Storage:
-    """Database storage manager"""
+    """Storage manager with MongoDB and file fallback"""
     
     @staticmethod
     def save_channels(channels: List[Dict]):
-        """Save channels to MongoDB"""
+        """Save channels to storage"""
         try:
-            if db:
+            if mongo_client is not None and channels_collection is not None:
+                # Clear and insert all channels
                 channels_collection.delete_many({})
                 if channels:
                     channels_collection.insert_many(channels)
             else:
                 # Fallback to file
                 with open('channels_backup.json', 'w') as f:
-                    json.dump(channels, f)
+                    json.dump(channels, f, default=str)
         except Exception as e:
             logger.error(f"Error saving channels: {e}")
     
     @staticmethod
     def load_channels() -> List[Dict]:
-        """Load channels from MongoDB"""
+        """Load channels from storage"""
         try:
-            if db:
-                return list(channels_collection.find({}, {'_id': 0}))
+            if mongo_client is not None and channels_collection is not None:
+                # Load from MongoDB
+                channels = list(channels_collection.find({}, {'_id': 0}))
+                # Convert ObjectId to string if needed
+                for channel in channels:
+                    if '_id' in channel:
+                        del channel['_id']
+                return channels
             else:
                 # Fallback from file
                 if os.path.exists('channels_backup.json'):
@@ -101,9 +131,10 @@ class Storage:
     
     @staticmethod
     def save_users(users: Dict):
-        """Save users to MongoDB"""
+        """Save users to storage"""
         try:
-            if db:
+            if mongo_client is not None and users_collection is not None:
+                # Update or insert each user
                 for user_id, user_data in users.items():
                     users_collection.update_one(
                         {'user_id': int(user_id)},
@@ -113,15 +144,16 @@ class Storage:
             else:
                 # Fallback to file
                 with open('users_backup.json', 'w') as f:
-                    json.dump(users, f)
+                    json.dump(users, f, default=str)
         except Exception as e:
             logger.error(f"Error saving users: {e}")
     
     @staticmethod
     def load_users() -> Dict:
-        """Load users from MongoDB"""
+        """Load users from storage"""
         try:
-            if db:
+            if mongo_client is not None and users_collection is not None:
+                # Load from MongoDB
                 users = {}
                 for user in users_collection.find({}, {'_id': 0}):
                     users[str(user['user_id'])] = user
@@ -138,9 +170,10 @@ class Storage:
     
     @staticmethod
     def save_referrals(referrals: Dict):
-        """Save referrals to MongoDB"""
+        """Save referrals to storage"""
         try:
-            if db:
+            if mongo_client is not None and referrals_collection is not None:
+                # Clear and insert all referrals
                 referrals_collection.delete_many({})
                 referrals_list = []
                 for referred_id, referrer_id in referrals.items():
@@ -154,15 +187,16 @@ class Storage:
             else:
                 # Fallback to file
                 with open('referrals_backup.json', 'w') as f:
-                    json.dump(referrals, f)
+                    json.dump(referrals, f, default=str)
         except Exception as e:
             logger.error(f"Error saving referrals: {e}")
     
     @staticmethod
     def load_referrals() -> Dict:
-        """Load referrals from MongoDB"""
+        """Load referrals from storage"""
         try:
-            if db:
+            if mongo_client is not None and referrals_collection is not None:
+                # Load from MongoDB
                 referrals = {}
                 for ref in referrals_collection.find({}, {'_id': 0}):
                     referrals[str(ref['referred_id'])] = str(ref['referrer_id'])
@@ -178,7 +212,7 @@ class Storage:
             return {}
 
 class DataManager:
-    """Manage all data with MongoDB persistence"""
+    """Manage all data with storage persistence"""
     
     def __init__(self):
         self.channels = []
@@ -190,16 +224,16 @@ class DataManager:
         atexit.register(self.backup_all_data)
     
     def load_all_data(self):
-        """Load all data from database"""
-        logger.info("📂 Loading data from database...")
+        """Load all data from storage"""
+        logger.info("📂 Loading data from storage...")
         self.channels = Storage.load_channels()
         self.users = Storage.load_users()
         self.referrals = Storage.load_referrals()
         logger.info(f"✅ Loaded {len(self.channels)} channels, {len(self.users)} users, {len(self.referrals)} referrals")
     
     def backup_all_data(self):
-        """Backup all data to database"""
-        logger.info("💾 Backing up data to database...")
+        """Backup all data to storage"""
+        logger.info("💾 Backing up data to storage...")
         Storage.save_channels(self.channels)
         Storage.save_users(self.users)
         Storage.save_referrals(self.referrals)
@@ -207,12 +241,14 @@ class DataManager:
     
     def get_stats(self) -> str:
         """Get data statistics"""
+        total_balance = sum(u.get('balance', 0) for u in self.users.values())
         return (
             f"📊 **Database Statistics:**\n\n"
             f"📢 Channels: {len(self.channels)}\n"
             f"👥 Users: {len(self.users)}\n"
             f"🔗 Referrals: {len(self.referrals)}\n"
-            f"💰 Total Balance: ₹{sum(u.get('balance', 0) for u in self.users.values()):.2f}"
+            f"💰 Total Balance: ₹{total_balance:.2f}\n"
+            f"💾 Storage: {'✅ MongoDB' if db_connected else '📁 Local files'}"
         )
 
 # Global data manager
@@ -277,7 +313,7 @@ class ChannelManager:
             return False
 
 class UserManager:
-    """Manage users with MongoDB"""
+    """Manage users"""
     
     @staticmethod
     def get_user(user_id: int) -> Dict:
@@ -382,11 +418,6 @@ class UserManager:
         
         logger.info(f"New referral: {referrer_id} → {referred_id}")
         return True
-    
-    @staticmethod
-    def get_all_users() -> List[Dict]:
-        """Get all users for admin"""
-        return list(data_manager.users.values())
 
 async def check_channel_membership(bot, user_id: int) -> tuple:
     channels = ChannelManager.get_channels()
@@ -970,7 +1001,7 @@ async def confirm_reset_callback(update: Update, context: ContextTypes.DEFAULT_T
     logger.warning(f"Admin {user.id} reset all bot data")
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Backup data to files (Admin only)"""
+    """Backup data (Admin only)"""
     user = update.effective_user
     
     if user.id not in ADMIN_IDS:
@@ -983,7 +1014,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = data_manager.get_stats()
     await update.message.reply_text(
         f"✅ **Data Backup Complete!**\n\n{stats}\n\n"
-        f"Data is safely stored in MongoDB."
+        f"Data is safely stored in {'MongoDB' if db_connected else 'local files'}."
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1112,7 +1143,7 @@ async def admin_handle_callback(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "admin_backup":
         data_manager.backup_all_data()
         await query.edit_message_text(
-            text="✅ **Backup Complete!**\n\nAll data saved to database.",
+            text="✅ **Backup Complete!**\n\nAll data saved to storage.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
             ])
@@ -1183,7 +1214,7 @@ def run_http_server():
             self.send_response(200)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
-            response = f"Bot is running\nUsers: {len(data_manager.users)}\nChannels: {len(data_manager.channels)}"
+            response = f"Bot is running\nUsers: {len(data_manager.users)}\nChannels: {len(data_manager.channels)}\nStorage: {'MongoDB' if db_connected else 'Local files'}"
             self.wfile.write(response.encode())
         
         def log_message(self, format, *args):
@@ -1245,7 +1276,7 @@ def main():
     print(f"👥 Users: {len(data_manager.users)}")
     print(f"🔗 Referrals: {len(data_manager.referrals)}")
     print(f"🌐 HTTP Server: http://0.0.0.0:{PORT}")
-    print(f"💾 Database: {'✅ MongoDB' if db else '❌ Local files'}")
+    print(f"💾 Database: {'✅ MongoDB' if db_connected else '📁 Local files'}")
     
     try:
         application.run_polling(
