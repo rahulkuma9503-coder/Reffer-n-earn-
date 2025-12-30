@@ -40,6 +40,8 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS', '').split(','))) if os.getenv('ADMIN_IDS') else []
 PORT = int(os.getenv('PORT', 8080))
 MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
+# Environment variable for initial channels (comma-separated)
+INITIAL_CHANNELS = os.getenv('INITIAL_CHANNELS', '').split(',') if os.getenv('INITIAL_CHANNELS') else []
 
 # Global variables for database
 mongo_client = None
@@ -225,6 +227,9 @@ class DataManager:
         self.referrals = {}
         self.load_all_data()
         
+        # Initialize channels from environment variable if empty
+        self.init_channels_from_env()
+        
         # Backup data on exit
         atexit.register(self.backup_all_data)
     
@@ -235,6 +240,14 @@ class DataManager:
         self.users = Storage.load_users()
         self.referrals = Storage.load_referrals()
         logger.info(f"✅ Loaded {len(self.channels)} channels, {len(self.users)} users, {len(self.referrals)} referrals")
+    
+    def init_channels_from_env(self):
+        """Initialize channels from environment variable"""
+        if not self.channels and INITIAL_CHANNELS:
+            logger.info(f"Initializing channels from environment variable: {INITIAL_CHANNELS}")
+            for chat_id in INITIAL_CHANNELS:
+                if chat_id.strip():
+                    ChannelManager.add_channel(chat_id.strip())
     
     def backup_all_data(self):
         """Backup all data to storage"""
@@ -249,7 +262,7 @@ class DataManager:
         total_balance = sum(u.get('balance', 0) for u in self.users.values())
         return (
             f"📊 **Database Statistics:**\n\n"
-            f"📢 Channels: {len(self.channels)}\n"
+            f"📢 Channels/Groups: {len(self.channels)}\n"
             f"👥 Users: {len(self.users)}\n"
             f"🔗 Referrals: {len(self.referrals)}\n"
             f"💰 Total Balance: ₹{total_balance:.2f}\n"
@@ -260,25 +273,30 @@ class DataManager:
 data_manager = DataManager()
 
 class ChannelManager:
-    """Manage channels"""
+    """Manage channels and groups"""
     
     @staticmethod
     def get_channels() -> List[Dict]:
         return data_manager.channels
     
     @staticmethod
-    def add_channel(chat_id: str) -> bool:
+    def add_channel(chat_id: str, chat_type: str = "channel") -> bool:
         try:
             clean_id = chat_id.strip()
             
-            # Format chat_id
+            # Format chat_id for both groups and channels
             if clean_id.startswith('@'):
                 chat_id_str = clean_id
             else:
+                # For numeric IDs
                 if clean_id.startswith('-'):
                     chat_id_str = clean_id
                 elif clean_id.isdigit() or (clean_id.startswith('100') and len(clean_id) > 9):
-                    chat_id_str = f"-{clean_id.lstrip('-')}"
+                    # Check if it's a group (starts with -) or channel
+                    if chat_type == "group":
+                        chat_id_str = f"-{clean_id.lstrip('-')}"
+                    else:
+                        chat_id_str = f"-100{clean_id.lstrip('-100')}" if not clean_id.startswith('-100') else clean_id
                 else:
                     return False
             
@@ -287,10 +305,11 @@ class ChannelManager:
                 if str(channel.get('chat_id')) == str(chat_id_str):
                     return False
             
-            # Add channel
+            # Add channel/group
             channel = {
                 'chat_id': chat_id_str,
-                'name': f"Channel {len(data_manager.channels) + 1}",
+                'name': f"Channel {len(data_manager.channels) + 1}" if chat_type == "channel" else f"Group {len(data_manager.channels) + 1}",
+                'type': chat_type,
                 'added_at': datetime.now().isoformat()
             }
             data_manager.channels.append(channel)
@@ -450,6 +469,44 @@ async def check_channel_membership(bot, user_id: int) -> tuple:
     
     return len(not_joined) == 0, not_joined
 
+async def get_invite_link(bot, chat_id):
+    """Get or create invite link for a chat"""
+    try:
+        # Try to get the chat first
+        if isinstance(chat_id, str) and chat_id.lstrip('-').isdigit():
+            chat_id_int = int(chat_id)
+        else:
+            chat_id_int = chat_id
+        
+        chat = await bot.get_chat(chat_id_int)
+        
+        # Try to get existing invite link
+        try:
+            invite_link = await chat.export_invite_link()
+            return invite_link
+        except:
+            # If no invite link exists, try to create one
+            # Note: Bot needs to be admin with invite link permission
+            try:
+                invite_link = await bot.create_chat_invite_link(
+                    chat_id=chat_id_int,
+                    creates_join_request=False
+                )
+                return invite_link.invite_link
+            except Exception as e:
+                logger.error(f"Failed to create invite link: {e}")
+                # Fallback to username if available
+                if hasattr(chat, 'username') and chat.username:
+                    return f"https://t.me/{chat.username}"
+                else:
+                    return f"https://t.me/c/{str(chat_id_int).replace('-100', '')}"
+    except Exception as e:
+        logger.error(f"Error getting invite link for {chat_id}: {e}")
+        # Last resort fallback
+        if isinstance(chat_id, str) and chat_id.startswith('@'):
+            return f"https://t.me/{chat_id.lstrip('@')}"
+        return None
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command - FIXED VERSION"""
     try:
@@ -531,7 +588,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def show_join_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, not_joined: List[Dict]):
-    """Show join buttons for channels"""
+    """Show join buttons for channels/groups"""
     try:
         user = update.effective_user
         
@@ -539,28 +596,23 @@ async def show_join_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         for channel in not_joined:
             chat_id = channel['chat_id']
             channel_name = channel.get('name', 'Join Channel')
+            chat_type = channel.get('type', 'channel')
             
-            if isinstance(chat_id, str) and chat_id.startswith('-'):
-                try:
-                    # Try to create invite link
-                    chat = await context.bot.get_chat(int(chat_id))
-                    invite_link = await chat.export_invite_link()
-                    keyboard.append([
-                        InlineKeyboardButton(f"📢 {channel_name}", url=invite_link)
-                    ])
-                except Exception as e:
-                    logger.error(f"Failed to get invite link for {chat_id}: {e}")
-                    # Use alternative format
-                    keyboard.append([
-                        InlineKeyboardButton(f"📢 {channel_name}", url=f"https://t.me/{chat_id.lstrip('-')}")
-                    ])
-            elif isinstance(chat_id, str) and chat_id.startswith('@'):
+            # Get invite link
+            invite_link = await get_invite_link(context.bot, chat_id)
+            
+            if invite_link:
+                icon = "📢" if chat_type == "channel" else "👥"
                 keyboard.append([
-                    InlineKeyboardButton(f"📢 {channel_name}", url=f"https://t.me/{chat_id.lstrip('@')}")
+                    InlineKeyboardButton(f"{icon} {channel_name}", url=invite_link)
                 ])
             else:
+                # Fallback for private chats without invite links
                 keyboard.append([
-                    InlineKeyboardButton(f"📢 {channel_name}", url=f"https://t.me/c/{chat_id}")
+                    InlineKeyboardButton(
+                        f"🔒 {channel_name} (Contact Admin)", 
+                        callback_data="no_invite_link"
+                    )
                 ])
         
         keyboard.append([
@@ -569,8 +621,8 @@ async def show_join_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         
         message_text = (
             f"👋 Welcome {user.first_name}!\n\n"
-            f"To use this bot, you need to join {len(not_joined)} channel(s).\n"
-            f"After joining all channels, click 'Verify Join' below."
+            f"To use this bot, you need to join {len(not_joined)} required chat(s).\n"
+            f"After joining all chats, click 'Verify Join' below."
         )
         
         if update.callback_query:
@@ -590,6 +642,11 @@ async def show_join_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         logger.error(f"Error in show_join_buttons: {e}")
         await update.message.reply_text("Error showing join buttons. Please try again.")
 
+async def no_invite_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle no invite link callback"""
+    query = update.callback_query
+    await query.answer("This chat doesn't have an invite link. Please contact the admin to add you manually.", show_alert=True)
+
 async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle verify join button callback"""
     try:
@@ -606,7 +663,7 @@ async def verify_join_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if has_joined:
             UserManager.update_user(user.id, {'has_joined_channels': True})
             await query.edit_message_text(
-                "✅ **Verified!** You've joined all required channels.\n\n"
+                "✅ **Verified!** You've joined all required chats.\n\n"
                 "Now you can access all bot features."
             )
             await show_main_menu_callback(update, context)
@@ -877,7 +934,7 @@ async def referrals_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         message += "**How it works:**\n"
         message += "1. Share your invite link\n"
-        message += "2. Friend joins all channels\n"
+        message += "2. Friend joins all chats\n"
         message += "3. Friend starts bot with your link\n"
         message += "4. You earn ₹1 immediately!"
         
@@ -936,7 +993,7 @@ async def invite_link_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # Admin Commands
 async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add channel - admin only"""
+    """Add channel/group - admin only"""
     try:
         user = update.effective_user
         
@@ -946,32 +1003,41 @@ async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         if not context.args:
             await update.message.reply_text(
-                "❌ **Usage:** `/addchannel <channel_uid>`\n\n"
+                "❌ **Usage:** `/addchannel <chat_id> [type]`\n\n"
                 "**Examples:**\n"
-                "`/addchannel -1001234567890`\n"
-                "`/addchannel @username`",
+                "`/addchannel -1001234567890` (channel)\n"
+                "`/addchannel @username` (channel)\n"
+                "`/addchannel -1234567890 group` (group)\n\n"
+                "**Types:** channel (default), group",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
         
         chat_id = context.args[0]
-        success = ChannelManager.add_channel(chat_id)
+        chat_type = "channel"
+        
+        if len(context.args) > 1:
+            if context.args[1].lower() in ['group', 'g']:
+                chat_type = "group"
+        
+        success = ChannelManager.add_channel(chat_id, chat_type)
         
         if success:
             await update.message.reply_text(
-                f"✅ **Channel Added!**\n\n"
-                f"**UID:** {chat_id}\n"
-                f"**Total Channels:** {len(data_manager.channels)}",
+                f"✅ **{'Channel' if chat_type == 'channel' else 'Group'} Added!**\n\n"
+                f"**ID:** {chat_id}\n"
+                f"**Type:** {chat_type}\n"
+                f"**Total Chats:** {len(data_manager.channels)}",
                 parse_mode=ParseMode.MARKDOWN
             )
         else:
-            await update.message.reply_text("❌ Failed to add channel")
+            await update.message.reply_text("❌ Failed to add chat. It might already exist.")
     except Exception as e:
         logger.error(f"Error in add_channel_command: {e}")
-        await update.message.reply_text("Error adding channel")
+        await update.message.reply_text("Error adding chat")
 
 async def remove_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove channel - admin only"""
+    """Remove channel/group - admin only"""
     try:
         user = update.effective_user
         
@@ -981,7 +1047,7 @@ async def remove_channel_command(update: Update, context: ContextTypes.DEFAULT_T
         
         if not context.args:
             await update.message.reply_text(
-                "❌ **Usage:** `/removechannel <channel_uid>`\n\n"
+                "❌ **Usage:** `/removechannel <chat_id>`\n\n"
                 "**Example:** `/removechannel -1001234567890`"
             )
             return
@@ -991,17 +1057,17 @@ async def remove_channel_command(update: Update, context: ContextTypes.DEFAULT_T
         
         if success:
             await update.message.reply_text(
-                f"✅ **Channel Removed!**\n\n"
-                f"**UID:** {chat_id}\n"
+                f"✅ **Chat Removed!**\n\n"
+                f"**ID:** {chat_id}\n"
                 f"**Remaining:** {len(data_manager.channels)}"
             )
         else:
-            await update.message.reply_text("❌ Channel not found")
+            await update.message.reply_text("❌ Chat not found")
     except Exception as e:
         logger.error(f"Error in remove_channel_command: {e}")
 
 async def list_channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """List all channels - admin only"""
+    """List all channels/groups - admin only"""
     try:
         user = update.effective_user
         
@@ -1012,13 +1078,16 @@ async def list_channels_command(update: Update, context: ContextTypes.DEFAULT_TY
         channels = ChannelManager.get_channels()
         
         if not channels:
-            await update.message.reply_text("📭 No channels added")
+            await update.message.reply_text("📭 No chats added")
             return
         
-        message = "📢 **Required Channels:**\n\n"
+        message = "📢 **Required Chats:**\n\n"
         for i, channel in enumerate(channels, 1):
-            message += f"{i}. {channel.get('name', 'Channel')}\n"
-            message += f"   `{channel.get('chat_id', 'N/A')}`\n\n"
+            chat_type = channel.get('type', 'channel')
+            icon = "📢" if chat_type == "channel" else "👥"
+            message += f"{i}. {icon} {channel.get('name', 'Chat')}\n"
+            message += f"   `{channel.get('chat_id', 'N/A')}`\n"
+            message += f"   Type: {chat_type}\n\n"
         
         await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -1044,7 +1113,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚠️ **WARNING: Data Reset**\n\n"
                 "This will delete ALL data:\n"
                 "• All users and balances\n"
-                "• All channels\n"
+                "• All chats\n"
                 "• All referral records\n\n"
                 "**This action cannot be undone!**\n\n"
                 "Are you sure you want to reset all data?",
@@ -1086,7 +1155,7 @@ async def confirm_reset_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(
             "✅ **All Data Reset!**\n\n"
             "• Users: 0\n"
-            "• Channels: 0\n"
+            "• Chats: 0\n"
             "• Referrals: 0\n\n"
             "Bot is now fresh and clean."
         )
@@ -1147,9 +1216,9 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"👑 **Admin Panel**\n\n"
             f"{stats}\n\n"
             "**Commands:**\n"
-            "• `/addchannel <uid>` - Add channel\n"
-            "• `/removechannel <uid>` - Remove channel\n"
-            "• `/listchannels` - List channels\n"
+            "• `/addchannel <id> [type]` - Add chat\n"
+            "• `/removechannel <id>` - Remove chat\n"
+            "• `/listchannels` - List chats\n"
             "• `/broadcast <message>` - Broadcast\n"
             "• `/restart` - Restart options\n"
             "• `/backup` - Backup data\n"
@@ -1157,7 +1226,7 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         
         keyboard = [
-            [InlineKeyboardButton("📢 Channels", callback_data="admin_channels")],
+            [InlineKeyboardButton("📢 Chats", callback_data="admin_channels")],
             [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
             [InlineKeyboardButton("💾 Backup", callback_data="admin_backup")],
             [InlineKeyboardButton("🔄 Restart", callback_data="admin_restart")],
@@ -1186,13 +1255,15 @@ async def admin_channels_callback(update: Update, context: ContextTypes.DEFAULT_
         
         channels = ChannelManager.get_channels()
         
-        message = f"📢 **Channel Management**\n\nTotal: {len(channels)}\n\n"
+        message = f"📢 **Chat Management**\n\nTotal: {len(channels)}\n\n"
         
         keyboard = []
         for channel in channels:
+            chat_type = channel.get('type', 'channel')
+            icon = "📢" if chat_type == "channel" else "👥"
             keyboard.append([
                 InlineKeyboardButton(
-                    f"❌ {channel.get('name', 'Channel')[:20]}",
+                    f"❌ {icon} {channel.get('name', 'Chat')[:20]}",
                     callback_data=f"admin_remove_{channel.get('chat_id', '')}"
                 )
             ])
@@ -1223,18 +1294,20 @@ async def admin_handle_callback(update: Update, context: ContextTypes.DEFAULT_TY
             success = ChannelManager.remove_channel(chat_id)
             
             if success:
-                await query.answer("✅ Channel removed", show_alert=True)
+                await query.answer("✅ Chat removed", show_alert=True)
                 await admin_channels_callback(update, context)
             else:
                 await query.answer("❌ Failed", show_alert=True)
         
         elif data == "admin_add_info":
             await query.edit_message_text(
-                text="**Add Channel**\n\n"
-                     "Use command: `/addchannel <uid>`\n\n"
+                text="**Add Chat**\n\n"
+                     "Use command: `/addchannel <id> [type]`\n\n"
                      "**Examples:**\n"
-                     "`/addchannel -1001234567890`\n"
-                     "`/addchannel @username`",
+                     "`/addchannel -1001234567890` (channel)\n"
+                     "`/addchannel @username` (channel)\n"
+                     "`/addchannel -1234567890 group` (group)\n\n"
+                     "**Types:** channel (default), group",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🔙 Back", callback_data="admin_channels")]
@@ -1315,7 +1388,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• /withdraw - Withdraw money\n"
             "• /help - Show this message\n\n"
             "**How to Earn:**\n"
-            "• Join required channels\n"
+            "• Join required chats\n"
             "• Share your invite link\n"
             "• Earn ₹1 per referral\n\n"
             "**Withdrawal:**\n"
@@ -1336,7 +1409,7 @@ def run_http_server():
             self.send_response(200)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
-            response = f"Bot is running\nUsers: {len(data_manager.users)}\nChannels: {len(data_manager.channels)}\nStorage: {'MongoDB' if db_connected else 'Local files'}"
+            response = f"Bot is running\nUsers: {len(data_manager.users)}\nChats: {len(data_manager.channels)}\nStorage: {'MongoDB' if db_connected else 'Local files'}"
             self.wfile.write(response.encode())
         
         def log_message(self, format, *args):
@@ -1379,6 +1452,7 @@ def main():
     
     # Callback handlers
     application.add_handler(CallbackQueryHandler(verify_join_callback, pattern="^verify_join$"))
+    application.add_handler(CallbackQueryHandler(no_invite_link_callback, pattern="^no_invite_link$"))
     application.add_handler(CallbackQueryHandler(show_main_menu_callback, pattern="^back_to_main$"))
     application.add_handler(CallbackQueryHandler(show_main_menu_callback, pattern="^refresh$"))
     application.add_handler(CallbackQueryHandler(balance_callback, pattern="^balance$"))
@@ -1406,7 +1480,7 @@ def main():
     print(f"✅ Bot started successfully!")
     print(f"🤖 Bot username: @{bot_username}")
     print(f"👑 Admin IDs: {ADMIN_IDS}")
-    print(f"📢 Channels: {len(data_manager.channels)}")
+    print(f"📢 Chats: {len(data_manager.channels)}")
     print(f"👥 Users: {len(data_manager.users)}")
     print(f"🔗 Referrals: {len(data_manager.referrals)}")
     print(f"🌐 HTTP Server: http://0.0.0.0:{PORT}")
@@ -1418,8 +1492,8 @@ def main():
     print("• /help - Show help")
     if ADMIN_IDS:
         print("👑 Admin commands:")
-        print("• /addchannel <uid> - Add channel")
-        print("• /listchannels - List all channels")
+        print("• /addchannel <id> [type] - Add chat")
+        print("• /listchannels - List all chats")
         print("• /stats - Show statistics")
     
     try:
